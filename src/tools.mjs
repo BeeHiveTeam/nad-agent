@@ -417,7 +417,7 @@ export function describeAction(a, resolved) {
     case "get_balance":
       return "Read: your MON balance";
     case "get_token_balance":
-      return `Read: your ${a.token ?? a.symbol ?? a.tokenAddress ?? "token"} token balance`;
+      return `Read: your ${safeEcho(a.token ?? a.symbol ?? a.tokenAddress ?? "token", 42)} token balance`;
     case "account": {
       const i = parseAccountIndex(a.index);
       if (i !== null) {
@@ -433,23 +433,25 @@ export function describeAction(a, resolved) {
       // path would re-read the book at display time, and the gap before the operator presses
       // y is exactly when the file can change. No resolution means no address to approve.
       const target = resolved?.ok ? formatRecipient(resolved) : "[recipient not resolved]";
-      return `Send ${a.amountMon} ${SYMBOL()} -> ${target}` +
+      return `Send ${safeEcho(a.amountMon, 32)} ${SYMBOL()} -> ${target}` +
         (config.gasMode === "dry-run" ? "  (DRY RUN — will be simulated)" : config.gasMode === "sponsored" ? "  (gasless)" : "  (you pay gas)");
     }
     case "send_token": {
-      // Same rule as send_mon: the line the operator approves shows what was resolved, never
-      // the raw model output. isWrite() covers send_token, so resolveSend() has already run.
-      const label = a.tokenSymbol || a.token || "token";
+      // The recipient shows what resolveSend produced, never the raw model output. Every
+      // other field here IS raw model output, so each is bounded by safeEcho at the length of
+      // the longest legitimate value: 32 for a symbol or amount, matching the bounds already
+      // used for chain-supplied metadata below.
+      const label = safeEcho(a.tokenSymbol || a.token || "token", 32);
       const dest = resolved?.ok ? formatRecipient(resolved) : "[recipient not resolved]";
-      return `Send ${a.amount} ${label} -> ${dest}` +
+      return `Send ${safeEcho(a.amount, 32)} ${label} -> ${dest}` +
         (config.gasMode === "dry-run" ? "  (DRY RUN — will be simulated)" : config.gasMode === "sponsored" ? "  (gasless)" : "  (you pay gas)");
     }
     case "transfer_nft": {
       // Same recipient rule as the sends above: show what was resolved, never the raw model
       // output. isWrite() covers transfer_nft, so resolveSend() has already run.
-      const contract = a.contractAddress ?? a.contract ?? "unknown contract";
+      const contract = safeEcho(a.contractAddress ?? a.contract ?? "unknown contract", 42);
       const dest = resolved?.ok ? formatRecipient(resolved) : "[recipient not resolved]";
-      // safeEcho for the same reason the label and recipient get it: this line is what the
+      // safeEcho for the same reason every other field here gets it: this line is what the
       // operator reads before approving, and an unsanitised value can reflow or overwrite
       // what follows. Trimmed as well, because runAction refuses padding but only after this
       // line has been shown and approved — the guard protects the wallet, not the reader, so
@@ -457,11 +459,11 @@ export function describeAction(a, resolved) {
       const from = a.fromAddress
         ? ` (from ${safeEcho(String(a.fromAddress).trim(), 42)})`
         : "";
-      return `Send NFT #${a.tokenId} (${contract}) -> ${dest}${from}` +
+      return `Send NFT #${safeEcho(a.tokenId, 78)} (${contract}) -> ${dest}${from}` +
         (config.gasMode === "dry-run" ? "  (DRY RUN — will be simulated)" : config.gasMode === "sponsored" ? "  (gasless)" : "  (you pay gas)");
     }
     case "swap":
-      return `Swap ${a.amountIn} ${a.tokenIn} -> ${a.tokenOut}` + gasSuffix();
+      return `Swap ${safeEcho(a.amountIn, 32)} ${safeEcho(a.tokenIn, 32)} -> ${safeEcho(a.tokenOut, 32)}` + gasSuffix();
     default:
       return "No on-chain action";
   }

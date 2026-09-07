@@ -206,6 +206,32 @@ describe("describeAction", () => {
   it("unknown action → No on-chain action", () => {
     assert.equal(describeAction({ action: "bogus" }), "No on-chain action");
   });
+
+  it("sanitises every model-supplied field it renders", () => {
+    // Only transfer_nft reaches this function from cli.mjs today — send_mon, send_token and
+    // swap each have their own preview block. These fields are pinned anyway: describeAction
+    // is exported, its whole contract is "a string a person reads before approving", and the
+    // moment a new write falls through to the else branch the hole comes back silently.
+    const ESC = String.fromCharCode(27);
+    const CR = String.fromCharCode(13);
+    const hostile = `x${ESC}[2K${CR}y`;
+    const resolved = { ok: true, address: "0x1234567890abcdef1234567890abcdef12345678", name: null };
+    const cases = [
+      ["get_token_balance token", { action: "get_token_balance", token: hostile }],
+      ["send_mon amountMon", { action: "send_mon", amountMon: hostile, to: "0xabc" }],
+      ["send_token label", { action: "send_token", tokenSymbol: hostile, amount: "1", to: "0xabc" }],
+      ["send_token amount", { action: "send_token", token: "USDC", amount: hostile, to: "0xabc" }],
+      ["swap amountIn", { action: "swap", amountIn: hostile, tokenIn: "A", tokenOut: "B" }],
+      ["swap tokenIn", { action: "swap", amountIn: "1", tokenIn: hostile, tokenOut: "B" }],
+      ["swap tokenOut", { action: "swap", amountIn: "1", tokenIn: "A", tokenOut: hostile }],
+    ];
+    for (const [what, action] of cases) {
+      const line = describeAction(action, resolved);
+      assert.ok(!line.includes(ESC), `ESC survived through ${what}: ${JSON.stringify(line)}`);
+      assert.ok(!line.includes(CR), `CR survived through ${what}: ${JSON.stringify(line)}`);
+    }
+  });
+
 });
 
 // ---------------------------------------------------------------------------
