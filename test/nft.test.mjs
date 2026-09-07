@@ -264,7 +264,7 @@ describe("runAction — get_nfts / transfer_nft guards", () => {
     assert.ok(!line.includes(CR), "CR survived into the confirmation line");
   });
 
-  it("describeAction neutralises control characters in tokenId and contract", async () => {
+  it("describeAction neutralises control characters in tokenId and contract", () => {
     // transfer_nft is the one write whose confirmation line comes from describeAction:
     // cli.mjs gives send_mon, send_token and swap their own preview blocks and falls through
     // to describeAction for everything else. tokenId and contractAddress are model output and
@@ -290,7 +290,7 @@ describe("runAction — get_nfts / transfer_nft guards", () => {
     assert.ok(!byContract.includes(CR), "CR survived through contractAddress");
   });
 
-  it("describeAction bounds tokenId and contract without pushing out the recipient", async () => {
+  it("describeAction bounds tokenId and contract without pushing out the recipient", () => {
     // Length matters for the same reason control characters do: fields long enough to wrap
     // push the recipient off the visible line, and the operator approves what is left. The
     // bounds are the longest legitimate value of each field — 78 digits for a uint256 token
