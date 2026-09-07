@@ -231,7 +231,6 @@ describe("describeAction", () => {
       assert.ok(!line.includes(CR), `CR survived through ${what}: ${JSON.stringify(line)}`);
     }
   });
-
 });
 
 // ---------------------------------------------------------------------------

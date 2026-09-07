@@ -439,9 +439,9 @@ export function describeAction(a, resolved) {
     case "send_token": {
       // The recipient shows what resolveSend produced, never the raw model output. Every
       // other field here IS raw model output, so each is bounded by safeEcho at the length of
-      // the longest legitimate value: 32 for a symbol or amount, matching the bounds already
-      // used for chain-supplied metadata below.
-      const label = safeEcho(a.tokenSymbol || a.token || "token", 32);
+      // the longest legitimate value: 42 for a symbol or a 0x address — ACTIONS documents
+      // `token` as either — and 32 for an amount.
+      const label = safeEcho(a.tokenSymbol || a.token || "token", 42);
       const dest = resolved?.ok ? formatRecipient(resolved) : "[recipient not resolved]";
       return `Send ${safeEcho(a.amount, 32)} ${label} -> ${dest}` +
         (config.gasMode === "dry-run" ? "  (DRY RUN — will be simulated)" : config.gasMode === "sponsored" ? "  (gasless)" : "  (you pay gas)");
@@ -463,7 +463,7 @@ export function describeAction(a, resolved) {
         (config.gasMode === "dry-run" ? "  (DRY RUN — will be simulated)" : config.gasMode === "sponsored" ? "  (gasless)" : "  (you pay gas)");
     }
     case "swap":
-      return `Swap ${safeEcho(a.amountIn, 32)} ${safeEcho(a.tokenIn, 32)} -> ${safeEcho(a.tokenOut, 32)}` + gasSuffix();
+      return `Swap ${safeEcho(a.amountIn, 32)} ${safeEcho(a.tokenIn, 42)} -> ${safeEcho(a.tokenOut, 42)}` + gasSuffix();
     default:
       return "No on-chain action";
   }
