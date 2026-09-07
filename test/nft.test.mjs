@@ -264,6 +264,50 @@ describe("runAction — get_nfts / transfer_nft guards", () => {
     assert.ok(!line.includes(CR), "CR survived into the confirmation line");
   });
 
+  it("describeAction neutralises control characters in tokenId and contract", async () => {
+    // transfer_nft is the one write whose confirmation line comes from describeAction:
+    // cli.mjs gives send_mon, send_token and swap their own preview blocks and falls through
+    // to describeAction for everything else. tokenId and contractAddress are model output and
+    // reach the line raw, so the same argument that put safeEcho on fromAddress applies here.
+    const ESC = String.fromCharCode(27);
+    const CR = String.fromCharCode(13);
+    const resolved = { ok: true, address: "0x1234567890abcdef1234567890abcdef12345678", name: null };
+
+    const byTokenId = describeAction(
+      { action: "transfer_nft", contractAddress: resolved.address,
+        tokenId: `1${ESC}[2K${CR}Send NFT to attacker`, to: resolved.address },
+      resolved,
+    );
+    assert.ok(!byTokenId.includes(ESC), "ESC survived through tokenId");
+    assert.ok(!byTokenId.includes(CR), "CR survived through tokenId");
+
+    const byContract = describeAction(
+      { action: "transfer_nft", contractAddress: `${resolved.address}${ESC}[2K${CR}x`,
+        tokenId: "1", to: resolved.address },
+      resolved,
+    );
+    assert.ok(!byContract.includes(ESC), "ESC survived through contractAddress");
+    assert.ok(!byContract.includes(CR), "CR survived through contractAddress");
+  });
+
+  it("describeAction bounds tokenId and contract without pushing out the recipient", async () => {
+    // Length matters for the same reason control characters do: fields long enough to wrap
+    // push the recipient off the visible line, and the operator approves what is left. The
+    // bounds are the longest legitimate value of each field — 78 digits for a uint256 token
+    // id, 42 characters for an address — so a real transfer is never truncated, and the
+    // recipient stays whole no matter what the model sent.
+    const resolved = { ok: true, address: "0x1234567890abcdef1234567890abcdef12345678", name: null };
+    const line = describeAction(
+      { action: "transfer_nft", contractAddress: "0x" + "a".repeat(400),
+        tokenId: "9".repeat(400), to: resolved.address },
+      resolved,
+    );
+    assert.ok(line.includes(resolved.address), `recipient was pushed out of: ${line}`);
+    assert.ok(line.includes("..."), "oversized fields were not truncated");
+    // 78 + 42 bounded fields, their ellipses, the 42-character recipient and the fixed text.
+    assert.ok(line.length < 260, `confirmation line was not bounded: ${line.length} chars`);
+  });
+
   it("transfer_nft with missing contract returns refusal", async () => {
     const resolved = { ok: true, address: "0x1234567890abcdef1234567890abcdef12345678", name: null };
     const res = await runAction({ action: "transfer_nft", tokenId: "1", to: "0x1234567890abcdef1234567890abcdef12345678" }, resolved);
