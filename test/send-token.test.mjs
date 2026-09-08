@@ -24,6 +24,8 @@ import { KNOWN_TOKENS } from "../src/tokens.mjs";
 
 const DEAD = "0x000000000000000000000000000000000000dEaD";
 const BAD_TOKEN_CHECKSUM = "0x534b2F3A21130d7a60830c2Df862319e593943A3";
+// All-digit address: its EIP-55 form is itself, so the test asserts on one exact string.
+const NO_SYMBOL_TOKEN = "0x1111111111111111111111111111111111111111";
 
 // ---------------------------------------------------------------------------
 // ACTIONS shape
@@ -427,6 +429,64 @@ describe("previewTokenSend", () => {
 
     assert.equal(preview.policyNote, "recipient allowlisted");
     assert.match(block, /Policy:\s+recipient allowlisted/);
+  });
+
+  it("renders the whole contract address when the token exposes no symbol()", async () => {
+    // getTokenMetadata omits `symbol` when symbol() does not resolve (Promise.allSettled),
+    // and prepareTokenSend then stands the contract address in for it. That value is 42
+    // characters, so a shorter bound renders an address that is not the address — and a
+    // truncation ending in "..." is indistinguishable from a symbol that ends that way.
+    const prepared = await prepareTokenSend(
+      { action: "send_token", token: NO_SYMBOL_TOKEN, to: DEAD, amount: "1" },
+      { getMetadata: async () => ({ address: NO_SYMBOL_TOKEN, decimals: 18 }) },
+    );
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.token.symbol, NO_SYMBOL_TOKEN, "the address stands in for the missing symbol");
+
+    const preview = await previewTokenSend(prepared, {
+      getBalance: async () => 10n ** 19n,
+      quoteSend: async () => ({ fee: 0n }),
+      simulateSend: async () => ({ simulated: true }),
+    });
+    assert.equal(preview.ok, true);
+    assert.equal(preview.symbol, NO_SYMBOL_TOKEN, "the bound must not cut the address");
+
+    // Every line that carries the symbol has to carry all 42 characters of it, not the
+    // first 32 with an ellipsis. Asserting per line rather than on the whole block so a
+    // failure names the line that lost it.
+    const carriers = renderTokenSendPreview(preview)
+      .split("\n")
+      .filter((line) => /^(Token|Amount|Balance):/.test(line));
+    assert.equal(carriers.length, 3, "Token, Amount and Balance each show the symbol");
+    for (const line of carriers) {
+      assert.ok(line.includes(NO_SYMBOL_TOKEN), `address was truncated on: ${line}`);
+    }
+  });
+
+  it("still strips control characters from a token symbol", async () => {
+    // The bound is only half of what safeEcho does here. Raising it must not be mistaken
+    // for loosening it: a symbol read off the chain is third-party text, and this block is
+    // what the operator approves. Without this case, deleting the wrapper entirely leaves
+    // the suite green — measured, not assumed.
+    const ESC = String.fromCharCode(27);
+    const CR = String.fromCharCode(13);
+    const hostile = `USDC${ESC}[2K${CR}approved`;
+    const prepared = await prepareTokenSend(
+      { action: "send_token", token: NO_SYMBOL_TOKEN, to: DEAD, amount: "1" },
+      { getMetadata: async () => ({ address: NO_SYMBOL_TOKEN, symbol: hostile, decimals: 18 }) },
+    );
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.token.symbol, hostile, "prepareTokenSend passes the symbol through as read");
+
+    const preview = await previewTokenSend(prepared, {
+      getBalance: async () => 10n ** 19n,
+      quoteSend: async () => ({ fee: 0n }),
+      simulateSend: async () => ({ simulated: true }),
+    });
+    const block = renderTokenSendPreview(preview);
+    assert.ok(!preview.symbol.includes(ESC), "the escape byte must not survive into the preview");
+    assert.ok(!block.includes(ESC), "the escape byte must not survive into the rendered block");
+    assert.match(preview.symbol, /^USDC/, "the printable part of the symbol is kept");
   });
 });
 

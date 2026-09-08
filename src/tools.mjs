@@ -566,7 +566,10 @@ export async function previewTokenSend(
 
   const before = await getBalance(token.address);
   const after = before - amountWei;
-  const symbol = safeEcho(token.symbol, 32);
+  // 42, not 32: prepareTokenSend puts the contract address in `symbol` when the token
+  // exposes no symbol(), and ACTIONS documents `token` as a symbol or a contract address,
+  // so an address is a legitimate value for this field. 32 cut it ten characters short.
+  const symbol = safeEcho(token.symbol, 42);
   const name = token.name ? safeEcho(token.name, 64) : "";
   let fee = 0n;
   let feeQuoted = false;
@@ -1045,7 +1048,9 @@ export async function runAction(a, resolved, opts = {}) {
         return "Refused: send_token has invalid prepared token values";
       }
       const res = await wallet.sendToken(to, token.address, amountWei);
-      const label = safeEcho(token.symbol || token.address, 32);
+      // Same bound and the same reason as the confirmation block above: this falls back to
+      // the address, and an address is 42 characters.
+      const label = safeEcho(token.symbol || token.address, 42);
       const displayAmount = formatTokenUnits(amountWei, token.decimals);
 
       if (res.dryRun) {
