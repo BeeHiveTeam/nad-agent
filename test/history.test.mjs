@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
+import { once } from "node:events";
 import { getHistory, normalizeHistoryTransaction } from "../src/wallet.mjs";
 import { config } from "../src/config.mjs";
 
@@ -96,5 +98,181 @@ describe("getHistory", () => {
     const result = await getHistory({ ownerAddress: OWNER, limit: 2, fetchImpl });
     assert.equal(result.length, 2);
     assert.deepEqual(result.map((tx) => tx.amount), [3n, 2n]);
+  });
+});
+
+/**
+ * A local stand-in for MonadScan, one mode per endpoint:
+ *
+ *   "ok"      answers normally
+ *   "headers" never responds at all
+ *   "body"    sends headers and an opening brace, then never finishes the body
+ *
+ * A hand-written fetch double can only show that the deadline fired; it cannot show that
+ * the request was cancelled, because a double that ignores `signal` looks exactly like one
+ * that honours it. A real connection can: `stalledSockets` holds the socket each stalled
+ * request arrived on, and aborting the request destroys it. `fetchImpl` below only
+ * re-points the host, so the production code still builds its own URL and the real fetch
+ * and abort paths run.
+ */
+async function explorerFixture({ transactions = "ok", internal = "ok", items = [] } = {}) {
+  const stalledSockets = [];
+  const server = http.createServer((req, res) => {
+    const mode = req.url.includes("/internal-transactions") ? internal : transactions;
+    if (mode === "headers") {
+      stalledSockets.push(req.socket);
+      return;
+    }
+    if (mode === "body") {
+      stalledSockets.push(req.socket);
+      res.writeHead(200, { "content-type": "application/json", "transfer-encoding": "chunked" });
+      res.write('{"items":');
+      return;
+    }
+    // Only the transactions endpoint carries rows, so a result of one proves which half
+    // of the history survived rather than just counting to one.
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ items: req.url.includes("/internal-transactions") ? [] : items }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const base = `http://127.0.0.1:${server.address().port}`;
+  return {
+    stalledSockets,
+    fetchImpl: (url, opts) => fetch(base + new URL(url).pathname + new URL(url).search, opts),
+    close() {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+/**
+ * A cancelled request's socket is destroyed a tick after `getHistory` resolves, so this
+ * waits for the close rather than sampling `destroyed` and racing it. An uncancelled
+ * request never closes, which is the failure this has to report rather than hang on.
+ */
+async function wasCancelled(socket) {
+  const closed = await Promise.race([
+    once(socket, "close").then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 1000).unref()),
+  ]);
+  return closed;
+}
+
+/**
+ * A deadline that never fires makes the call under test hang, and a hung test reports
+ * nothing at all — `npm test` sets no per-test timeout, so CI would sit on it. Bound the
+ * wait here so the failure is a red assertion naming the missing deadline.
+ */
+async function settlesWithin(promise, ms, message) {
+  promise.catch(() => {}); // the losing side of the race must not surface as unhandled
+  const outcome = await Promise.race([
+    promise.then((value) => ({ value }), (error) => ({ error })),
+    new Promise((resolve) => setTimeout(() => resolve(null), ms).unref()),
+  ]);
+  assert.ok(outcome, message);
+  if ("error" in outcome) throw outcome.error;
+  return outcome.value;
+}
+
+const INCOMING = {
+  hash: `0x${"d".repeat(64)}`,
+  from: { hash: OTHER },
+  to: { hash: OWNER },
+  value: "7",
+  timestamp: "2026-09-12T00:00:00Z",
+};
+
+describe("getHistory — request deadlines", () => {
+  it("returns the healthy endpoint's history when the other never sends headers", async () => {
+    const fixture = await explorerFixture({ internal: "headers", items: [INCOMING] });
+    try {
+      const result = await settlesWithin(
+        getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 150 }),
+        4000,
+        "a stalled endpoint must not keep /history waiting",
+      );
+      assert.equal(result.length, 1);
+      assert.equal(result[0].hash, INCOMING.hash);
+      // The point of the deadline is not that we stopped waiting but that the request is
+      // gone: a stalled request left open holds a socket on the explorer side too.
+      assert.equal(fixture.stalledSockets.length, 1);
+      assert.ok(await wasCancelled(fixture.stalledSockets[0]), "the timed-out request must be cancelled, not abandoned");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("returns the healthy endpoint's history when the other stalls mid-body", async () => {
+    // Headers arrive, so a deadline that only covered the response headers would consider
+    // this request finished and wait forever on `res.json()`.
+    const fixture = await explorerFixture({ internal: "body", items: [INCOMING] });
+    try {
+      const result = await settlesWithin(
+        getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 150 }),
+        4000,
+        "a deadline that ends at the headers leaves the body read hanging",
+      );
+      assert.equal(result.length, 1);
+      assert.equal(result[0].hash, INCOMING.hash);
+      assert.ok(await wasCancelled(fixture.stalledSockets[0]), "the timed-out body read must be cancelled");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("fails with both endpoints named when neither answers", async () => {
+    const fixture = await explorerFixture({ transactions: "headers", internal: "body" });
+    try {
+      await assert.rejects(
+        settlesWithin(
+          getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 150 }),
+          4000,
+          "two stalled endpoints must still fail the command",
+        ),
+        (err) => {
+          // Rejecting rather than resolving is the whole of the scripted exit code: an
+          // empty list takes cli.mjs:417 instead, which prints "no recent transactions
+          // found" and returns without setting hadFailure — a total outage would read as
+          // an empty history and exit 0. The message matters too, since that is what
+          // cli.mjs prints, and a rejection naming only the first endpoint hid half of it.
+          assert.match(err.message, /transactions —/);
+          assert.match(err.message, /internal transactions —/);
+          assert.match(err.message, /timed out after 150ms/);
+          return true;
+        },
+      );
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("leaves no deadline armed once the requests are done", async () => {
+    // The timer outliving the request would keep the event loop alive after `/history`
+    // returned, delaying a scripted run's exit by the length of the deadline.
+    const pending = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+    const fixture = await explorerFixture({ items: [INCOMING] });
+    try {
+      const before = pending();
+      await getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 60_000 });
+      assert.ok(pending() <= before, "a settled request must not leave its deadline armed");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("ignores a deadline that is not a usable number instead of timing out at once", async () => {
+    // setTimeout treats NaN as "fire now": taken literally, an unusable deadline would
+    // cancel every history request rather than none of them.
+    const fixture = await explorerFixture({ items: [INCOMING] });
+    try {
+      for (const timeoutMs of [Number.NaN, 0, -1, Number.POSITIVE_INFINITY, "soon", null]) {
+        const result = await getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs });
+        assert.equal(result.length, 1, `timeoutMs=${String(timeoutMs)} must fall back to the default`);
+      }
+    } finally {
+      fixture.close();
+    }
   });
 });

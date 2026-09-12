@@ -187,28 +187,71 @@ export function normalizeHistoryTransaction(tx, ownerAddress = address) {
   };
 }
 
-async function fetchExplorerItems(path, fetchImpl) {
-  const res = await fetchImpl(`${config.chain.explorerUrl}${path}`, {
-    headers: { accept: "application/json" },
-  });
-  if (!res.ok) throw new Error(`MonadScan API error ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`);
-  const data = await res.json();
-  return Array.isArray(data) ? data : (data?.items ?? []);
+/**
+ * How long one explorer request may take, headers and body together. A slow MonadScan is
+ * not what this guards against: a request that never settles is, because `/history` waits
+ * for both endpoints and the REPL waits for `/history`.
+ */
+const EXPLORER_TIMEOUT_MS = 10_000;
+
+async function fetchExplorerItems(path, fetchImpl, timeoutMs) {
+  // One controller covers the body read as well as the headers. A response whose headers
+  // arrive and whose body then stalls hangs just as completely as one that never answers,
+  // and aborting after the headers still tears the body stream down. The timer is cleared
+  // in `finally` so a normal answer leaves nothing pending holding the event loop open.
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`MonadScan request timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
+  try {
+    const res = await fetchImpl(`${config.chain.explorerUrl}${path}`, {
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`MonadScan API error ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`);
+    const data = await res.json();
+    return Array.isArray(data) ? data : (data?.items ?? []);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Read recent native transfers involving the smart account from MonadScan. */
-export async function getHistory({ limit = 10, ownerAddress = address, fetchImpl = fetch } = {}) {
+export async function getHistory({
+  limit = 10,
+  ownerAddress = address,
+  fetchImpl = fetch,
+  timeoutMs = EXPLORER_TIMEOUT_MS,
+} = {}) {
   if (!ownerAddress) throw new Error("Wallet not initialized");
   const cap = Math.max(1, Math.min(Number(limit) || 10, 50));
+  // A non-finite or non-positive deadline is not a laxer deadline: setTimeout treats NaN
+  // as "fire now", which would fail every history read rather than none of them.
+  const requested = Number(timeoutMs);
+  const deadline = Number.isFinite(requested) && requested > 0 ? requested : EXPLORER_TIMEOUT_MS;
   const owner = checksumAddress(ownerAddress);
   const encoded = encodeURIComponent(owner);
-  const results = await Promise.allSettled([
-    fetchExplorerItems(`/api/v2/addresses/${encoded}/transactions`, fetchImpl),
-    fetchExplorerItems(`/api/v2/addresses/${encoded}/internal-transactions`, fetchImpl),
-  ]);
+  const sources = [
+    ["transactions", `/api/v2/addresses/${encoded}/transactions`],
+    ["internal transactions", `/api/v2/addresses/${encoded}/internal-transactions`],
+  ];
+  const results = await Promise.allSettled(
+    sources.map(([, path]) => fetchExplorerItems(path, fetchImpl, deadline)),
+  );
   const fulfilled = results.filter((result) => result.status === "fulfilled");
   if (!fulfilled.length) {
-    throw results[0].reason;
+    // Both endpoints are gone. Rethrowing only `results[0].reason` dropped the second one,
+    // and a timeout's own reason names a URL path rather than which half of the history is
+    // missing. `/history` prints this message and, scripted, exits non-zero on it, so it
+    // has to say which sources failed and why.
+    const reasons = results.map((result) => result.reason);
+    throw new AggregateError(
+      reasons,
+      `history unavailable: ${sources
+        .map(([label], i) => `${label} — ${reasons[i]?.message ?? reasons[i]}`)
+        .join("; ")}`,
+    );
   }
   const entries = fulfilled
     .flatMap((result) => result.value)
