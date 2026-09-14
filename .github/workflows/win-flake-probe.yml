@@ -1,0 +1,50 @@
+# Measurement only, for issue #95. Runs the already-merged suite repeatedly on the same
+# runner image CI uses, to get the flake rate and the loopback round-trip from the real
+# environment rather than from a developer machine. Gates nothing.
+name: win-flake-probe
+
+on:
+  push:
+    branches: [ci/windows-flake-probe]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run build
+
+      - name: loopback round-trip, cold vs warm
+        run: node probe/rtt.mjs
+
+      - name: wasCancelled against a socket that already closed
+        run: node probe/closed.mjs
+
+      - name: run the suite 20 times
+        shell: bash
+        run: |
+          failed=0
+          for i in $(seq 1 20); do
+            out=$(npm test 2>&1) || true
+            pass=$(printf '%s' "$out" | sed -n 's/^# pass \([0-9]*\)/\1/p')
+            fail=$(printf '%s' "$out" | sed -n 's/^# fail \([0-9]*\)/\1/p')
+            canc=$(printf '%s' "$out" | sed -n 's/^# cancelled \([0-9]*\)/\1/p')
+            bad=$(printf '%s' "$out" | grep -E '^ *not ok [0-9]+ - ' | sed 's/^ *not ok [0-9]* - //' | tr '\n' ';')
+            echo "run $i: pass=${pass:-?} fail=${fail:-?} cancelled=${canc:-?} $bad"
+            # No counter absent from the output means the run did not report, which is a
+            # failure to observe — not a pass. Blank must never read as zero.
+            if [ -z "$fail" ] || [ "$fail" != "0" ] || [ "${canc:-0}" != "0" ]; then
+              failed=$((failed + 1))
+            fi
+          done
+          echo "runs with a failure or no report: $failed of 20"
