@@ -102,62 +102,83 @@ describe("getHistory", () => {
 });
 
 /**
- * A local stand-in for MonadScan, one mode per endpoint:
+ * A stand-in for MonadScan, one mode per endpoint:
  *
- *   "ok"      answers normally
+ *   "ok"      answers instantly, in process
  *   "headers" never responds at all
  *   "body"    sends headers and an opening brace, then never finishes the body
  *
- * A hand-written fetch double can only show that the deadline fired; it cannot show that
- * the request was cancelled, because a double that ignores `signal` looks exactly like one
- * that honours it. A real connection can: `stalledSockets` holds the socket each stalled
- * request arrived on, and aborting the request destroys it. `fetchImpl` below only
- * re-points the host, so the production code still builds its own URL and the real fetch
- * and abort paths run.
+ * Only a stalled endpoint goes over a real connection, because cancellation is the one
+ * thing a hand-written double cannot show: a double that ignores `signal` looks exactly
+ * like one that honours it. An answered endpoint has nothing to prove that way, so it is
+ * a plain double and returns without touching the network — which is what keeps these
+ * tests off the clock. The healthy half used to race the fixture deadline over loopback,
+ * and on the CI Windows image that race is what went red.
+ *
+ * `stalledSockets` holds the socket each stalled request arrived on; aborting the request
+ * destroys it, and that is the assertion the real connection exists for.
  */
-async function explorerFixture({ transactions = "ok", internal = "ok", items = [] } = {}) {
+async function explorerFixture({ transactions = "ok", internal = "ok", items = [], overNetwork = false } = {}) {
   const stalledSockets = [];
-  const server = http.createServer((req, res) => {
-    const mode = req.url.includes("/internal-transactions") ? internal : transactions;
-    if (mode === "headers") {
+  const stalls = overNetwork || transactions !== "ok" || internal !== "ok";
+  let server = null;
+  let base = "";
+  if (stalls) {
+    server = http.createServer((req, res) => {
+      if (req.url.startsWith("/ok")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ items: req.url.endsWith("/internal") ? [] : items }));
+        return;
+      }
+      // Everything else routed here is a stall, so every arrival is one to record.
       stalledSockets.push(req.socket);
-      return;
-    }
-    if (mode === "body") {
-      stalledSockets.push(req.socket);
-      res.writeHead(200, { "content-type": "application/json", "transfer-encoding": "chunked" });
-      res.write('{"items":');
-      return;
-    }
-    // Only the transactions endpoint carries rows, so a result of one proves which half
-    // of the history survived rather than just counting to one.
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ items: req.url.includes("/internal-transactions") ? [] : items }));
-  });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const base = `http://127.0.0.1:${server.address().port}`;
+      if (req.url.startsWith("/body")) {
+        res.writeHead(200, { "content-type": "application/json", "transfer-encoding": "chunked" });
+        res.write('{"items":');
+      }
+      // "/headers": no response at all, not even a status line.
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    base = `http://127.0.0.1:${server.address().port}`;
+  }
   return {
     stalledSockets,
-    fetchImpl: (url, opts) => fetch(base + new URL(url).pathname + new URL(url).search, opts),
+    fetchImpl: (url, opts) => {
+      const internalPath = url.includes("/internal-transactions");
+      const mode = internalPath ? internal : transactions;
+      if (mode !== "ok") return fetch(`${base}/${mode}`, opts);
+      // Only the transactions endpoint carries rows, so a result of one proves which half
+      // of the history survived rather than just counting to one.
+      if (overNetwork) return fetch(`${base}/ok${internalPath ? "/internal" : ""}`, opts);
+      return Promise.resolve({
+        ok: true,
+        async json() {
+          return { items: internalPath ? [] : items };
+        },
+      });
+    },
     close() {
-      server.closeAllConnections();
-      server.close();
+      server?.closeAllConnections();
+      server?.close();
     },
   };
 }
 
 /**
  * A cancelled request's socket is destroyed a tick after `getHistory` resolves, so this
- * waits for the close rather than sampling `destroyed` and racing it. An uncancelled
- * request never closes, which is the failure this has to report rather than hang on.
+ * waits for the close rather than sampling and racing it. The close may equally have
+ * happened already, and subscribing to an event that is past reports a cancelled request
+ * as uncancelled after burning the whole timeout — so the settled state is checked first.
+ * An uncancelled request never closes, which is the failure this has to report rather
+ * than hang on.
  */
 async function wasCancelled(socket) {
-  const closed = await Promise.race([
+  if (socket.destroyed) return true;
+  return await Promise.race([
     once(socket, "close").then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), 1000).unref()),
   ]);
-  return closed;
 }
 
 /**
@@ -184,13 +205,26 @@ const INCOMING = {
   timestamp: "2026-09-12T00:00:00Z",
 };
 
+/**
+ * The deadline the stall tests hand to `getHistory`. It no longer has to beat a healthy
+ * response — those are answered in process now — but a stalled request still has to reach
+ * the server before it expires, or there is no socket left to assert on. 500 ms is twenty
+ * times the slowest first request measured on the CI runner images (23.5 ms on
+ * windows-latest, 21.2 ms on ubuntu-latest) and eight times under the absolute bound
+ * below, which is what still turns a missing production deadline into a prompt failure
+ * rather than a hang.
+ */
+const STALL_DEADLINE_MS = 500;
+/** Absolute, so it does not move with the deadline it is meant to catch the absence of. */
+const SETTLE_BOUND_MS = 4000;
+
 describe("getHistory — request deadlines", () => {
   it("returns the healthy endpoint's history when the other never sends headers", async () => {
     const fixture = await explorerFixture({ internal: "headers", items: [INCOMING] });
     try {
       const result = await settlesWithin(
-        getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 150 }),
-        4000,
+        getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: STALL_DEADLINE_MS }),
+        SETTLE_BOUND_MS,
         "a stalled endpoint must not keep /history waiting",
       );
       assert.equal(result.length, 1);
@@ -210,8 +244,8 @@ describe("getHistory — request deadlines", () => {
     const fixture = await explorerFixture({ internal: "body", items: [INCOMING] });
     try {
       const result = await settlesWithin(
-        getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 150 }),
-        4000,
+        getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: STALL_DEADLINE_MS }),
+        SETTLE_BOUND_MS,
         "a deadline that ends at the headers leaves the body read hanging",
       );
       assert.equal(result.length, 1);
@@ -222,13 +256,36 @@ describe("getHistory — request deadlines", () => {
     }
   });
 
+  it("reports a request cancelled before the check as cancelled, without waiting", async () => {
+    // On a fast machine the socket is already gone when the assertion runs. Subscribing to
+    // a close that has passed reported a cancelled request as uncancelled, and only after
+    // the full wait, so the observer has to read the settled state before it waits.
+    const server = http.createServer((req, res) => res.end("{}"));
+    let captured = null;
+    server.on("connection", (socket) => { captured ??= socket; });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      await fetch(`http://127.0.0.1:${server.address().port}/`).then((res) => res.json());
+      captured.destroy();
+      await once(captured, "close");
+
+      const started = Date.now();
+      assert.equal(await wasCancelled(captured), true, "a closed socket is a cancelled request");
+      assert.ok(Date.now() - started < 100, "the answer must not wait out an event that is past");
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
   it("fails with both endpoints named when neither answers", async () => {
     const fixture = await explorerFixture({ transactions: "headers", internal: "body" });
     try {
       await assert.rejects(
         settlesWithin(
-          getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: 150 }),
-          4000,
+          getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs: STALL_DEADLINE_MS }),
+          SETTLE_BOUND_MS,
           "two stalled endpoints must still fail the command",
         ),
         (err) => {
@@ -239,7 +296,7 @@ describe("getHistory — request deadlines", () => {
           // cli.mjs prints, and a rejection naming only the first endpoint hid half of it.
           assert.match(err.message, /transactions —/);
           assert.match(err.message, /internal transactions —/);
-          assert.match(err.message, /timed out after 150ms/);
+          assert.match(err.message, new RegExp(`timed out after ${STALL_DEADLINE_MS}ms`));
           return true;
         },
       );
@@ -265,7 +322,13 @@ describe("getHistory — request deadlines", () => {
   it("ignores a deadline that is not a usable number instead of timing out at once", async () => {
     // setTimeout treats NaN as "fire now": taken literally, an unusable deadline would
     // cancel every history request rather than none of them.
-    const fixture = await explorerFixture({ items: [INCOMING] });
+    //
+    // This one endpoint has to answer over a real connection, because an instant double
+    // resolves before an abort could reach it and the fallback would go untested. There is
+    // no race here to be flaky about: when the fallback works the budget is the full 10 s
+    // default, and when it is gone the abort fires at once regardless of how fast the
+    // response is.
+    const fixture = await explorerFixture({ items: [INCOMING], overNetwork: true });
     try {
       for (const timeoutMs of [Number.NaN, 0, -1, Number.POSITIVE_INFINITY, "soon", null]) {
         const result = await getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs });
