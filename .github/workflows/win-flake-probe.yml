@@ -59,6 +59,10 @@ jobs:
           say ""
           say "runs with a failure or no report: $failed of 20"
 
+          # The count also lands in the job conclusion: artifacts and logs need scopes this
+          # token does not have, so a green job is the machine-readable "0 of 20".
+          [ "$failed" = "0" ] || exit 1
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
