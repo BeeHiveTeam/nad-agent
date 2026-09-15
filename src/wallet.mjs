@@ -44,6 +44,11 @@ function getReadProvider() {
   return readProvider;
 }
 
+// Same shape of deadline as the explorer reads in #93, and for the same reason: a stalled
+// indexer otherwise keeps get_nfts waiting forever. Kept separate from EXPLORER_TIMEOUT_MS
+// because these are different services, and a slow indexer should not shorten history reads.
+const NFT_TIMEOUT_MS = 10_000;
+
 /**
  * GET a path from the Reservoir indexer (see config.reservoirUrl).
  *
@@ -52,7 +57,7 @@ function getReadProvider() {
  * (this is why the explorer is the source of truth for holdings). Reservoir is the only
  * new network dependency; nothing else about the wallet changes.
  */
-async function fetchReservoir(path) {
+async function fetchReservoir(path, { fetchImpl = fetch, timeoutMs = NFT_TIMEOUT_MS } = {}) {
   // No indexer for this network → refuse. Checked before the key so a mainnet operator
   // isn't sent to fetch a key for a host that doesn't exist. Reservoir has no Monad
   // mainnet endpoint, and answering from the testnet one would report another chain's
@@ -68,11 +73,35 @@ async function fetchReservoir(path) {
   if (!config.reservoirApiKey) {
     throw new Error("RESERVOIR_API_KEY is not set. Get a free key at https://reservoir.tools, then put it in .env");
   }
-  const res = await fetch(`${config.reservoirUrl}${path}`, { headers: { "x-api-key": config.reservoirApiKey } });
-  if (!res.ok) {
-    throw new Error(`Reservoir API error ${res.status}${res.statusText ? ` ${res.statusText}` : ""} for ${path}`);
+  // A non-finite or non-positive deadline is not a laxer deadline: setTimeout treats NaN as
+  // "fire now", which would fail every NFT read rather than none of them.
+  const requested = Number(timeoutMs);
+  const deadline = Number.isFinite(requested) && requested > 0 ? requested : NFT_TIMEOUT_MS;
+  // One controller covers the request AND the body read. A response whose headers arrive and
+  // whose JSON then stalls hangs just as completely as one that never answers, and aborting
+  // after the headers still tears the body stream down. Cleared in `finally` so a normal answer
+  // leaves no pending timer holding the event loop open.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), deadline);
+  try {
+    const res = await fetchImpl(`${config.reservoirUrl}${path}`, {
+      headers: { "x-api-key": config.reservoirApiKey },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Reservoir API error ${res.status}${res.statusText ? ` ${res.statusText}` : ""} for ${path}`);
+    }
+    return await res.json();
+  } catch (err) {
+    // The abort surfaces as an AbortError whose message is about a signal, which tells a wallet
+    // user nothing. Say which read timed out and after how long; everything else passes through.
+    if (controller.signal.aborted) {
+      throw new Error(`NFT read timed out after ${deadline}ms: the indexer did not answer for ${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 function buildWalletConfig() {
@@ -384,10 +413,10 @@ export function normalizeNftPage(data) {
  * Returns { tokens, skipped, truncated }; see normalizeNftPage for the shape and why the two
  * counters are part of it.
  */
-export async function getNfts(ownerAddress = address) {
+export async function getNfts(ownerAddress = address, { fetchImpl = fetch, timeoutMs = NFT_TIMEOUT_MS } = {}) {
   if (!ownerAddress) throw new Error("Wallet not initialized");
   const owner = checksumAddress(ownerAddress);
-  const data = await fetchReservoir(`/users/${owner}/tokens/v7?limit=${NFT_PAGE_LIMIT}`);
+  const data = await fetchReservoir(`/users/${owner}/tokens/v7?limit=${NFT_PAGE_LIMIT}`, { fetchImpl, timeoutMs });
   // Known follow-up: page past the limit via `continuation` for wallets with more. Until then
   // the caller is at least told the list is partial.
   return normalizeNftPage(data);
