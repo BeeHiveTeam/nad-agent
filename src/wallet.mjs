@@ -195,6 +195,36 @@ export async function listAccounts(count = 5) {
   return accounts;
 }
 
+/**
+ * The native amount an explorer row carries, or `null` when it carries none.
+ *
+ * `BigInt` is generous in ways an explorer row is not: `""`, `[]` and `false` all become 0,
+ * `true` becomes 1, `["5"]` unwraps to 5, and an object with a `toString` becomes whatever
+ * it says. None of those is an amount, and converting them invents a transfer the chain
+ * never saw — a row printed as `+0.0 MON` reads as a real zero-value transaction, not as a
+ * row we failed to understand. The rest (`"not-a-number"`, `"1.5"`, `NaN`, a bare object)
+ * makes `BigInt` throw, which used to take the whole history down with it.
+ *
+ * So: only a string, a number or a bigint is considered at all, and only a whole
+ * non-negative one survives. What `BigInt` itself accepts is left alone: hex, binary and
+ * octal literals, a leading `+`, surrounding whitespace. `0x2a` is already pinned as a
+ * readable row by the suite, and narrowing the grammar is not what this guard is for —
+ * inventing an amount out of something that carries none is.
+ */
+function parseHistoryAmount(value) {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  let amount;
+  try {
+    amount = BigInt(value);
+  } catch {
+    return null;
+  }
+  // A negative native amount is not a direction, it is a malformed row: `/history` prints
+  // the sign from `direction`, so -5 wei arrives as "in  +-0.000000000000000005 MON".
+  return amount < 0n ? null : amount;
+}
+
 export function normalizeHistoryTransaction(tx, ownerAddress = address) {
   if (!tx || !ownerAddress) return null;
   const owner = String(ownerAddress).toLowerCase();
@@ -204,7 +234,8 @@ export function normalizeHistoryTransaction(tx, ownerAddress = address) {
   const to = String(toAddress ?? "").toLowerCase();
   if (from !== owner && to !== owner) return null;
   const direction = from === owner ? "out" : "in";
-  const amount = BigInt(tx.value ?? 0);
+  const amount = parseHistoryAmount(tx.value);
+  if (amount === null) return null;
   const hash = tx.hash ?? tx.transaction_hash ?? tx.transactionHash;
   if (!hash) return null;
   return {
