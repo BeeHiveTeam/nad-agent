@@ -42,6 +42,65 @@ describe("normalizeHistoryTransaction", () => {
   });
 });
 
+/**
+ * What an explorer row's `value` may be, and what each shape has to mean. The point of the
+ * table is that the two halves are asserted the same way: a shape that survives and a shape
+ * that is skipped are both statements about the same guard, and listing them apart invites
+ * one half to drift.
+ *
+ * `BigInt` accepts far more than an amount ever is — `""`, `[]` and `false` reach it as 0,
+ * `true` as 1, `["5"]` as 5 — so these are skips, not zeroes. Its own numeric grammar is
+ * another matter and is kept: hex, binary and octal literals, a leading `+`, surrounding
+ * whitespace. Those are whole non-negative integers written oddly, not rows without an
+ * amount, and `0x2a` in particular is a shape this suite already relied on.
+ */
+const AMOUNT_SHAPES = [
+  ["a decimal string", "42", 42n],
+  ["a hex string", "0x2a", 42n],
+  ["a padded string", " 42 ", 42n],
+  ["a newline-padded string", "\n42\n", 42n],
+  ["a signed string", "+5", 5n],
+  ["a binary literal", "0b101", 5n],
+  ["an octal literal", "0o17", 15n],
+  ["a padded hex string", " 0x2a ", 42n],
+  ["a number", 42, 42n],
+  ["a bigint", 42n, 42n],
+  ["zero", "0", 0n],
+  ["a missing value", undefined, null],
+  ["null", null, null],
+  ["an empty string", "", null],
+  ["a blank string", "   ", null],
+  ["a word", "not-a-number", null],
+  ["a decimal fraction", "1.5", null],
+  ["exponent notation", "1e3", null],
+  ["a negative string", "-5", null],
+  ["a negative number", -5, null],
+  ["a negative bigint", -5n, null],
+  ["a fractional number", 1.5, null],
+  ["NaN", Number.NaN, null],
+  ["Infinity", Number.POSITIVE_INFINITY, null],
+  ["true", true, null],
+  ["false", false, null],
+  ["an empty array", [], null],
+  ["a single-element array", ["5"], null],
+  ["an object", {}, null],
+  ["an object with a toString", { toString: () => "7" }, null],
+  ["an object whose toString is null", { toString: null }, null],
+];
+
+describe("normalizeHistoryTransaction — value shapes", () => {
+  for (const [name, value, expected] of AMOUNT_SHAPES) {
+    it(`${expected === null ? "skips" : "reads"} ${name}`, () => {
+      const row = normalizeHistoryTransaction({ hash: HASH, from: OTHER, to: OWNER, value }, OWNER);
+      if (expected === null) {
+        assert.equal(row, null, "a row whose amount cannot be read must be skipped, not valued");
+      } else {
+        assert.equal(row?.amount, expected);
+      }
+    });
+  }
+});
+
 describe("getHistory", () => {
   it("combines explorer transactions and internal transactions newest first", async () => {
     const incomingHash = `0x${"b".repeat(64)}`;
@@ -81,6 +140,52 @@ describe("getHistory", () => {
     const result = await getHistory({ ownerAddress: OWNER, fetchImpl });
     assert.equal(result.length, 1);
     assert.equal(result[0].hash, HASH);
+  });
+
+  /** Serve `transactions` and `internal-transactions` from two explicit row lists. */
+  const twoEndpoints = (transactions, internal) => async (url) => ({
+    ok: true,
+    async json() {
+      return { items: url.endsWith("/internal-transactions") ? internal : transactions };
+    },
+  });
+
+  const VALID = { hash: HASH, from: OTHER, to: OWNER, value: "7", timestamp: "2026-09-17T10:00:00Z" };
+  const MALFORMED = { hash: `0x${"b".repeat(64)}`, from: OTHER, to: OWNER, value: "not-a-number" };
+
+  it("keeps the other endpoint's history when one endpoint sends a malformed row", async () => {
+    // The whole read used to die here: the conversion threw inside the map, so one bad row
+    // from one endpoint took the healthy endpoint's transactions down with it.
+    const result = await getHistory({ ownerAddress: OWNER, fetchImpl: twoEndpoints([VALID], [MALFORMED]) });
+    assert.deepEqual(result.map((tx) => tx.hash), [VALID.hash]);
+  });
+
+  it("keeps the other endpoint's history when the malformed row is in the first endpoint", async () => {
+    // Same row, other side. Which endpoint carries the bad row decides which entry the old
+    // code lost, so asserting only one direction would leave half the fix unpinned.
+    const result = await getHistory({ ownerAddress: OWNER, fetchImpl: twoEndpoints([MALFORMED], [VALID]) });
+    assert.deepEqual(result.map((tx) => tx.hash), [VALID.hash]);
+  });
+
+  it("keeps the valid rows of an endpoint that also sends a malformed one", async () => {
+    const other = { ...VALID, hash: `0x${"c".repeat(64)}`, value: "9", timestamp: "2026-09-17T09:00:00Z" };
+    const result = await getHistory({ ownerAddress: OWNER, fetchImpl: twoEndpoints([VALID, MALFORMED, other], []) });
+    assert.deepEqual(result.map((tx) => tx.amount), [7n, 9n]);
+  });
+
+  it("skips a row with no value instead of reporting a zero-value transaction", async () => {
+    // `+0.0 MON` in the output reads as a real zero-value transfer rather than as a row we
+    // could not read. Absent has to stay absent.
+    const noValue = { hash: `0x${"d".repeat(64)}`, from: OTHER, to: OWNER };
+    const result = await getHistory({ ownerAddress: OWNER, fetchImpl: twoEndpoints([VALID, noValue], []) });
+    assert.deepEqual(result.map((tx) => tx.hash), [VALID.hash]);
+  });
+
+  it("keeps newest-first ordering and the cap when malformed rows are interleaved", async () => {
+    const at = (h, hour, value) => ({ hash: `0x${h.repeat(64)}`, from: OTHER, to: OWNER, value, timestamp: `2026-09-17T0${hour}:00:00Z` });
+    const rows = [at("1", 1, "1"), MALFORMED, at("3", 3, "3"), { ...MALFORMED, hash: `0x${"e".repeat(64)}` }, at("2", 2, "2")];
+    const result = await getHistory({ ownerAddress: OWNER, limit: 2, fetchImpl: twoEndpoints(rows, []) });
+    assert.deepEqual(result.map((tx) => tx.amount), [3n, 2n], "skipped rows must not disturb order or fill the cap");
   });
 
   it("applies the requested result limit", async () => {
