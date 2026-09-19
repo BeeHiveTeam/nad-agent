@@ -184,11 +184,16 @@ describe("get_nfts deadline", () => {
   });
 
   it("treats a nonsense deadline as the default rather than as no deadline", async () => {
-    // Number("") is 0 and setTimeout(NaN) fires immediately: either would fail every read.
+    // The same shapes the history deadline pins, deliberately: this path took the clamp from
+    // that one but not its table — NaN was the only shape asserted here — and an asymmetric
+    // pair is how the next copy loses coverage again. The arithmetic itself is pinned once,
+    // in resolveDeadline; these two tables exist to show each path routes through it.
     const fx = await indexerFixture({ mode: "ok" });
     try {
-      const page = await getNfts(OWNER, { fetchImpl: fx.fetchImpl, timeoutMs: Number.NaN });
-      assert.equal(page.tokens.length, 1);
+      for (const timeoutMs of [Number.NaN, 0, -1, 0.5, Number.POSITIVE_INFINITY, "soon", null]) {
+        const page = await getNfts(OWNER, { fetchImpl: fx.fetchImpl, timeoutMs });
+        assert.equal(page.tokens.length, 1, `timeoutMs=${String(timeoutMs)} must not cancel the request`);
+      }
     } finally {
       fx.close();
     }
