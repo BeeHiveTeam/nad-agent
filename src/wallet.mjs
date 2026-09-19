@@ -44,6 +44,33 @@ function getReadProvider() {
   return readProvider;
 }
 
+/**
+ * `setTimeout`'s ceiling. A larger delay does not wait longer: Node warns and fires after a
+ * millisecond, so a deadline above this cancels every request instead of allowing a long one
+ * — the opposite of what the caller asked for.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * The deadline a read will actually use, given what the caller asked for.
+ *
+ * Exported because it is the whole of the rule and it is pure. Asserting it through a request
+ * means either racing a live response against a one-millisecond timer or waiting out a
+ * twenty-four-day one, and neither says anything this arithmetic does not.
+ *
+ * `NaN` fails the comparison and `Infinity` is capped by the same `Math.min` that caps an
+ * oversized finite value, so one comparison and one cap cover every shape. Below a
+ * millisecond falls back as well: Node sets any delay under 1 to 1 ms, so such a value asks
+ * for an immediate cancellation rather than a shorter wait.
+ */
+export function resolveDeadline(timeoutMs, fallbackMs) {
+  const requested = Number(timeoutMs);
+  // Floored, not passed through: setTimeout truncates a fraction anyway, and the deadline is
+  // quoted back in the timeout message — "timed out after 1.9ms" would claim a wait no timer
+  // ever honoured. The number the caller is told is the number that was used.
+  return requested >= 1 ? Math.min(Math.floor(requested), MAX_TIMEOUT_MS) : fallbackMs;
+}
+
 // Same shape of deadline as the explorer reads in #93, and for the same reason: a stalled
 // indexer otherwise keeps get_nfts waiting forever. Kept separate from EXPLORER_TIMEOUT_MS
 // because these are different services, and a slow indexer should not shorten history reads.
@@ -73,10 +100,7 @@ async function fetchReservoir(path, { fetchImpl = fetch, timeoutMs = NFT_TIMEOUT
   if (!config.reservoirApiKey) {
     throw new Error("RESERVOIR_API_KEY is not set. Get a free key at https://reservoir.tools, then put it in .env");
   }
-  // A non-finite or non-positive deadline is not a laxer deadline: setTimeout treats NaN as
-  // "fire now", which would fail every NFT read rather than none of them.
-  const requested = Number(timeoutMs);
-  const deadline = Number.isFinite(requested) && requested > 0 ? requested : NFT_TIMEOUT_MS;
+  const deadline = resolveDeadline(timeoutMs, NFT_TIMEOUT_MS);
   // One controller covers the request AND the body read. A response whose headers arrive and
   // whose JSON then stalls hangs just as completely as one that never answers, and aborting
   // after the headers still tears the body stream down. Cleared in `finally` so a normal answer
@@ -286,10 +310,7 @@ export async function getHistory({
 } = {}) {
   if (!ownerAddress) throw new Error("Wallet not initialized");
   const cap = Math.max(1, Math.min(Number(limit) || 10, 50));
-  // A non-finite or non-positive deadline is not a laxer deadline: setTimeout treats NaN
-  // as "fire now", which would fail every history read rather than none of them.
-  const requested = Number(timeoutMs);
-  const deadline = Number.isFinite(requested) && requested > 0 ? requested : EXPLORER_TIMEOUT_MS;
+  const deadline = resolveDeadline(timeoutMs, EXPLORER_TIMEOUT_MS);
   const owner = checksumAddress(ownerAddress);
   const encoded = encodeURIComponent(owner);
   const sources = [

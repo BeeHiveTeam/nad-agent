@@ -2,12 +2,52 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { getHistory, normalizeHistoryTransaction } from "../src/wallet.mjs";
+import { getHistory, normalizeHistoryTransaction, resolveDeadline } from "../src/wallet.mjs";
 import { config } from "../src/config.mjs";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const OTHER = "0x2222222222222222222222222222222222222222";
 const HASH = `0x${"a".repeat(64)}`;
+
+/**
+ * The deadline rule, asserted where it lives rather than through a request.
+ *
+ * Through a request it cannot be asserted honestly: with the bug the one-millisecond timer
+ * races the loopback response, and the same call rejects or succeeds run to run — measured at
+ * 36 rejections in 50 on the NFT path and 19 in 50 on this one, on one machine. With the fix
+ * the deadline is twenty-four days, so a test that waits for it to fire never finishes. The
+ * arithmetic has neither problem.
+ */
+describe("resolveDeadline", () => {
+  const FALLBACK = 10_000;
+  const CEILING = 2_147_483_647;
+  const cases = [
+    ["an ordinary deadline", 250, 250],
+    ["a fractional string", "1.9", 1],
+    ["the ceiling itself", CEILING, CEILING],
+    ["one past the ceiling", CEILING + 1, CEILING],
+    ["far past the ceiling", 5_000_000_000, CEILING],
+    ["the largest safe integer", Number.MAX_SAFE_INTEGER, CEILING],
+    ["Infinity", Number.POSITIVE_INFINITY, CEILING],
+    ["exactly one millisecond", 1, 1],
+    ["a fraction above one", 1.9, 1],
+    ["a larger fraction", 2.5, 2],
+    ["below one millisecond", 0.5, FALLBACK],
+    ["just below one millisecond", 0.999, FALLBACK],
+    ["zero", 0, FALLBACK],
+    ["negative", -1, FALLBACK],
+    ["NaN", Number.NaN, FALLBACK],
+    ["a word", "soon", FALLBACK],
+    ["null", null, FALLBACK],
+    ["undefined", undefined, FALLBACK],
+    ["a numeric string", "250", 250],
+  ];
+  for (const [name, input, expected] of cases) {
+    it(`${expected === FALLBACK ? "falls back for" : "uses"} ${name}`, () => {
+      assert.equal(resolveDeadline(input, FALLBACK), expected);
+    });
+  }
+});
 
 describe("normalizeHistoryTransaction", () => {
   it("normalizes an incoming explorer transaction", () => {
@@ -445,7 +485,10 @@ describe("getHistory — request deadlines", () => {
     // response is.
     const fixture = await explorerFixture({ items: [INCOMING], overNetwork: true });
     try {
-      for (const timeoutMs of [Number.NaN, 0, -1, Number.POSITIVE_INFINITY, "soon", null]) {
+      // The sub-millisecond values belong here rather than with the cap below: setTimeout
+      // rounds them up to 1 ms, so taken literally they cancel everything, which is the same
+      // failure as NaN and not a shorter deadline the caller could have meant.
+      for (const timeoutMs of [Number.NaN, 0, -1, 0.5, Number.POSITIVE_INFINITY, "soon", null]) {
         const result = await getHistory({ ownerAddress: OWNER, fetchImpl: fixture.fetchImpl, timeoutMs });
         assert.equal(result.length, 1, `timeoutMs=${String(timeoutMs)} must fall back to the default`);
       }
