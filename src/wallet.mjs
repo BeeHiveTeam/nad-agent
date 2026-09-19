@@ -44,6 +44,42 @@ function getReadProvider() {
   return readProvider;
 }
 
+/**
+ * `setTimeout`'s ceiling. A larger delay does not wait longer: Node warns and fires after a
+ * millisecond, so a deadline above this cancels every request instead of allowing a long one
+ * — the opposite of what the caller asked for.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * The deadline a read will actually use, given what the caller asked for.
+ *
+ * Exported because it is the whole of the rule and it is pure. Asserting it through a request
+ * means either racing a live response against a one-millisecond timer or waiting out a
+ * twenty-four-day one, and neither says anything this arithmetic does not.
+ *
+ * Three outcomes, not two: a usable duration is floored and capped, an oversized finite one
+ * is capped to the longest wait available, and anything that names no usable duration — `NaN`,
+ * `Infinity`, below a millisecond, a word — takes the default. Node sets any delay under 1 to
+ * 1 ms, which is why a sub-millisecond value belongs with the fallbacks rather than with the
+ * short waits.
+ */
+export function resolveDeadline(timeoutMs, fallbackMs) {
+  const requested = Number(timeoutMs);
+  // Floored, not passed through: setTimeout truncates a fraction anyway, and the deadline is
+  // quoted back in the timeout message — "timed out after 1.9ms" would claim a wait no timer
+  // ever honoured. The number the caller is told is the number that was used.
+  //
+  // Infinity falls back rather than being capped, and the difference is the point of the
+  // guard. A finite number is a duration the caller named: asking for longer than setTimeout
+  // can express is asking for the longest wait available, so it is capped. Infinity names no
+  // duration at all — capping it to 24.9 days would hand back the unbounded wait that #92 and
+  // #93 exist to remove, dressed as a deadline.
+  return Number.isFinite(requested) && requested >= 1
+    ? Math.min(Math.floor(requested), MAX_TIMEOUT_MS)
+    : fallbackMs;
+}
+
 // Same shape of deadline as the explorer reads in #93, and for the same reason: a stalled
 // indexer otherwise keeps get_nfts waiting forever. Kept separate from EXPLORER_TIMEOUT_MS
 // because these are different services, and a slow indexer should not shorten history reads.
@@ -73,10 +109,7 @@ async function fetchReservoir(path, { fetchImpl = fetch, timeoutMs = NFT_TIMEOUT
   if (!config.reservoirApiKey) {
     throw new Error("RESERVOIR_API_KEY is not set. Get a free key at https://reservoir.tools, then put it in .env");
   }
-  // A non-finite or non-positive deadline is not a laxer deadline: setTimeout treats NaN as
-  // "fire now", which would fail every NFT read rather than none of them.
-  const requested = Number(timeoutMs);
-  const deadline = Number.isFinite(requested) && requested > 0 ? requested : NFT_TIMEOUT_MS;
+  const deadline = resolveDeadline(timeoutMs, NFT_TIMEOUT_MS);
   // One controller covers the request AND the body read. A response whose headers arrive and
   // whose JSON then stalls hangs just as completely as one that never answers, and aborting
   // after the headers still tears the body stream down. Cleared in `finally` so a normal answer
@@ -255,14 +288,18 @@ export function normalizeHistoryTransaction(tx, ownerAddress = address) {
 const EXPLORER_TIMEOUT_MS = 10_000;
 
 async function fetchExplorerItems(path, fetchImpl, timeoutMs) {
+  // Clamped here rather than by the caller, so this wrapper and fetchReservoir resolve their
+  // own argument the same way. The rule is one function; leaving two call shapes around it is
+  // how the next copy picks the wrong one.
+  const deadline = resolveDeadline(timeoutMs, EXPLORER_TIMEOUT_MS);
   // One controller covers the body read as well as the headers. A response whose headers
   // arrive and whose body then stalls hangs just as completely as one that never answers,
   // and aborting after the headers still tears the body stream down. The timer is cleared
   // in `finally` so a normal answer leaves nothing pending holding the event loop open.
   const controller = new AbortController();
   const timer = setTimeout(
-    () => controller.abort(new Error(`MonadScan request timed out after ${timeoutMs}ms`)),
-    timeoutMs,
+    () => controller.abort(new Error(`MonadScan request timed out after ${deadline}ms`)),
+    deadline,
   );
   try {
     const res = await fetchImpl(`${config.chain.explorerUrl}${path}`, {
@@ -286,10 +323,6 @@ export async function getHistory({
 } = {}) {
   if (!ownerAddress) throw new Error("Wallet not initialized");
   const cap = Math.max(1, Math.min(Number(limit) || 10, 50));
-  // A non-finite or non-positive deadline is not a laxer deadline: setTimeout treats NaN
-  // as "fire now", which would fail every history read rather than none of them.
-  const requested = Number(timeoutMs);
-  const deadline = Number.isFinite(requested) && requested > 0 ? requested : EXPLORER_TIMEOUT_MS;
   const owner = checksumAddress(ownerAddress);
   const encoded = encodeURIComponent(owner);
   const sources = [
@@ -297,7 +330,7 @@ export async function getHistory({
     ["internal transactions", `/api/v2/addresses/${encoded}/internal-transactions`],
   ];
   const results = await Promise.allSettled(
-    sources.map(([, path]) => fetchExplorerItems(path, fetchImpl, deadline)),
+    sources.map(([, path]) => fetchExplorerItems(path, fetchImpl, timeoutMs)),
   );
   const fulfilled = results.filter((result) => result.status === "fulfilled");
   if (!fulfilled.length) {
