@@ -486,6 +486,40 @@ export async function getNfts(ownerAddress = address, { fetchImpl = fetch, timeo
   return normalizeNftPage(data);
 }
 
+/** The largest id an ERC-721 `uint256` can hold. */
+const MAX_TOKEN_ID = (1n << 256n) - 1n;
+
+/**
+ * The token id a caller named, or a refusal.
+ *
+ * `BigInt` alone is not a check: `""`, `"  "`, `[]` and `false` all reach it as 0, which is a
+ * real token id and so arrives as a complete, signable transfer of token #0 that nobody asked
+ * for. Everything else it dislikes throws a converter error instead — the only field on this
+ * path that still reaches ethers unchecked, which is what #79 fixed for `fromAddress` and what
+ * the comment at src/tools.mjs:1001 describes.
+ *
+ * So: only a string, a number or a bigint is considered, an empty or blank string is not a
+ * value, and the result has to fit the `uint256` the ABI declares. Hex stays welcome; `"0"`
+ * stays a token id, which is exactly what `""` must stop being.
+ *
+ * Throws rather than returning null because both refusals already in this file throw, and the
+ * value is deliberately left out of the message: `transferNft` echoes a raw tokenId at its
+ * wrong-owner refusal, and a second unescaped echo is not something to add here.
+ */
+function requireTokenId(tokenId) {
+  const usable =
+    typeof tokenId === "string" ? tokenId.trim() !== "" : typeof tokenId === "number" || typeof tokenId === "bigint";
+  if (usable) {
+    try {
+      const id = BigInt(tokenId);
+      if (id >= 0n && id <= MAX_TOKEN_ID) return id;
+    } catch {
+      /* not a number in any notation — falls through to the refusal */
+    }
+  }
+  throw new Error("Refused: tokenId must be a whole number from 0 to 2^256-1.");
+}
+
 /**
  * Calldata for one `safeTransferFrom`. Split out so the encoding is reachable
  * from a test without a wallet or a network, the way buildSwapCalls is.
@@ -494,7 +528,7 @@ export function buildNftTransferCalldata(fromAddress, to, tokenId) {
   return new Interface(ERC721_ABI).encodeFunctionData("safeTransferFrom", [
     checksumAddress(fromAddress),
     checksumAddress(to),
-    BigInt(tokenId),
+    requireTokenId(tokenId),
   ]);
 }
 
@@ -507,9 +541,16 @@ export function buildNftTransferCalldata(fromAddress, to, tokenId) {
  * Returns { dryRun } | { userOpHash, hash, fee }.
  */
 export async function transferNft(to, contractAddress, tokenId, fromAddress = address) {
+  // Resolved before the session check, for two reasons. A malformed argument is the caller's
+  // to fix whether or not a wallet is open, and it is what makes this refusal reachable from a
+  // test at all — every other statement in this function needs an initialised wallet. Same
+  // rule as the encoder below, resolved here rather than taken from the caller so the two
+  // cannot agree on a token nobody named: BigInt("") made this ask about #0 and the calldata
+  // encode #0.
+  const id = requireTokenId(tokenId);
   if (!account) throw new Error("Wallet not initialized");
   const token = new Contract(checksumAddress(contractAddress), ERC721_ABI, getReadProvider());
-  const owner = checksumAddress(await token.ownerOf(BigInt(tokenId)));
+  const owner = checksumAddress(await token.ownerOf(id));
   if (owner.toLowerCase() !== checksumAddress(fromAddress).toLowerCase()) {
     throw new Error(
       `Refused: ${fromAddress} does not own token #${tokenId} on ${contractAddress} — owner is ${owner}`,

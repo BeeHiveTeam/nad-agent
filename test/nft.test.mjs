@@ -11,7 +11,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parseAction, describeAction, runAction, isWrite, ACTIONS, systemPrompt } from "../src/tools.mjs";
-import { buildNftTransferCalldata, ERC721_ABI, normalizeNftPage } from "../src/wallet.mjs";
+import { buildNftTransferCalldata, ERC721_ABI, normalizeNftPage, transferNft } from "../src/wallet.mjs";
 import { Interface, getAddress } from "ethers";
 import { config } from "../src/config.mjs";
 
@@ -435,6 +435,73 @@ describe("buildNftTransferCalldata — decoded calldata", () => {
       buildNftTransferCalldata(from, to, big),
     );
     assert.equal(decoded[2], BigInt(big));
+  });
+
+  /**
+   * What a token id may be, and what each shape has to mean. Both directions in one table on
+   * purpose: a shape that encodes and a shape that is refused are statements about the same
+   * guard, and listing them apart is how one half drifts.
+   *
+   * `"0"` and `""` are the pair that matters. Token #0 is a real token, so a bare `BigInt`
+   * turned an empty id into a complete, signable transfer of it. They have to part ways here.
+   */
+  const MAX_UINT256 = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+  const TOKEN_IDS = [
+    ["a decimal string", "730", 730n],
+    ["zero", "0", 0n],
+    ["a hex string", "0x2a", 42n],
+    ["a padded string", " 42 ", 42n],
+    ["a number", 42, 42n],
+    ["a bigint", 42n, 42n],
+    ["the largest uint256", MAX_UINT256, BigInt(MAX_UINT256)],
+    ["an empty string", "", null],
+    ["a blank string", "   ", null],
+    ["a word", "abc", null],
+    ["a decimal fraction", "1.5", null],
+    ["exponent notation", "1e3", null],
+    ["a negative string", "-1", null],
+    ["a negative number", -1, null],
+    ["one past the largest uint256", (BigInt(MAX_UINT256) + 1n).toString(), null],
+    ["null", null, null],
+    ["undefined", undefined, null],
+    ["true", true, null],
+    ["false", false, null],
+    ["an empty array", [], null],
+    ["a single-element array", ["5"], null],
+    ["an object", {}, null],
+    ["an object with a toString", { toString: () => "7" }, null],
+  ];
+
+  for (const [name, tokenId, expected] of TOKEN_IDS) {
+    it(`${expected === null ? "refuses" : "encodes"} ${name}`, () => {
+      if (expected === null) {
+        assert.throws(
+          () => buildNftTransferCalldata(from, to, tokenId),
+          // The message is the point, not just the throw: every other unusable field on this
+          // path answers with a refusal the operator can read, and this one used to answer
+          // with whatever BigInt or ethers said.
+          (err) => err.message.startsWith("Refused:"),
+          `tokenId=${String(tokenId)} must be refused, and as a refusal`,
+        );
+      } else {
+        const decoded = iface.decodeFunctionData("safeTransferFrom", buildNftTransferCalldata(from, to, tokenId));
+        assert.equal(decoded[2], expected);
+      }
+    });
+  }
+
+  it("refuses the same ids from the ownership check, not only from the encoder", async () => {
+    // The two used to convert separately and agree on a fabricated id: BigInt("") asked
+    // ownerOf about token #0 while the calldata encoded token #0, so the check confirmed a
+    // token nobody named. This is reachable without a wallet only because the id is resolved
+    // before the session check — everything after it needs an initialised account.
+    for (const tokenId of ["", "   ", "abc", "-1", null, {}]) {
+      await assert.rejects(
+        transferNft(to, from, tokenId),
+        (err) => err.message.startsWith("Refused:"),
+        `tokenId=${String(tokenId)} must be refused before the wallet is consulted`,
+      );
+    }
   });
 
   it("refuses an address that is not one", () => {
